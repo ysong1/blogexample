@@ -22,12 +22,14 @@ import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
 import org.hibernate.cfg.Configuration;
+import org.springframework.security.crypto.bcrypt.BCrypt;
 
 import example.db.DBBlog;
 import example.db.DBBlog.FlatBlog;
 import example.db.DBComment;
 import example.db.DBComment.FlatComment;
 import example.db.DBLoginSession;
+import example.db.DBPasswordReset;
 import example.db.DBPost;
 import example.db.DBPost.FlatPost;
 import example.db.DBReport;
@@ -40,10 +42,33 @@ public class DB {
 	private static SessionFactory sessionFactory;
 	
 	/**
-	 * Star the database connection
+	 * Start the database connection
 	 */
 	public static void startDatabaseConnection() {
 		sessionFactory = newSessionFactory();
+		/**
+		 * The following Thread will run once per hour and will look for expired password reset requests
+		 */
+		new Thread(()-> {
+			while (true) {
+				
+				Session session = sessionFactory.openSession();
+				
+				long cutoff = System.currentTimeMillis() - (1000*60*60*24); // 24 hours ago
+				
+				session.beginTransaction();
+				try {
+					session.createQuery("delete DBPasswordReset pr where pr.date<" + cutoff).executeUpdate();
+					session.getTransaction().commit();
+				} catch (Exception e) {
+					session.getTransaction().rollback();
+				}
+				
+				session.close();
+				
+				try{Thread.sleep(1000*60*60);}catch(Exception e){} // sleep for 1 hour
+			}
+		}).start();
 	}
 	
 	/**
@@ -52,8 +77,7 @@ public class DB {
 	 */
 	private static SessionFactory newSessionFactory() {
 		Configuration configuration = new Configuration();
-
-
+		
 		configuration.setProperty("hibernate.connection.driver_class", "org.h2.Driver"); // use H2 driver
 		configuration.setProperty("hibernate.dialect", "org.hibernate.dialect.H2Dialect"); // use H2 dialect
 		configuration.setProperty("hibernate.connection.url", "jdbc:h2:./exampledb"); // create database called "exampledb" in project directory (aka working directory)
@@ -71,30 +95,15 @@ public class DB {
 		configuration.addAnnotatedClass(DBBlog.class);
 		configuration.addAnnotatedClass(DBReport.class);
 		configuration.addAnnotatedClass(DBSiteSetting.class);
+		configuration.addAnnotatedClass(DBPasswordReset.class);
 
 		StandardServiceRegistryBuilder builder = new StandardServiceRegistryBuilder().applySettings(configuration.getProperties()); // apply default settings 
 		return configuration.buildSessionFactory(builder.build()); // build the SessionFactory
 	}
 	
-	/** 
-	 * Get a DBUser from the user table by id
-	 * @param id
-	 * @return
-	 * @throws DBNotFoundException 
-	 */
-	public static FlatUser getUserById(long id) throws DBNotFoundException {
-		Session session = sessionFactory.openSession(); // open connection to database
-		DBUser user = session.get(DBUser.class, id); // this is the important line, get the DBUser using the provided id
-		if (user == null) throw new DBNotFoundException();
-		FlatUser flatUser = user.flatten(); // make sure to call this *before* closing the session
-		session.close(); // NEVER FORGET TO CLOSE THE SESSION!!!
-		return flatUser; 
-	}
-	
-
 	/**
-	 * @param token
-	 * @return ****null if user does not exist!!****
+	 * @param token token from user
+	 * @return FlatUser containing user, or null if user does not exist ** IMPORTANT, DOES NOT THROW EXCEPTION **
 	 */
 	public static FlatUser getUserByToken(Cookie token) {
 		Session session = sessionFactory.openSession(); // open connection to database
@@ -107,9 +116,9 @@ public class DB {
 	
 	/**
 	 * 
-	 * @param token
-	 * @param session
-	 * @return null if user does not exist or token is null, else the user with that token
+	 * @param token token from user
+	 * @param session database session
+	 * @return FlatUser containing user, or null if user does not exist ** IMPORTANT, DOES NOT THROW EXCEPTION **
 	 */
 	private static DBUser getUserByToken(Session session, Cookie token) {
 		if (token == null) return null;
@@ -134,32 +143,29 @@ public class DB {
 	/**
 	 * Creates a new login session
 	 * @param email email address of user
-	 * @param password password of user to be tested
+	 * @param password password of user, to be tested for correctness
 	 * @return String containing new login token
-	 * @throws DBNotFoundException 
-	 * @throws DBIncorrectPasswordException 
-	 * @throws DBRollbackException 
+	 * @throws DBNotFoundException  if the email address does not exist in the database
+	 * @throws DBIncorrectPasswordException if the provided password is incorrect
+	 * @throws DBRollbackException if the database was rolled back (should never happend) 
 	 */
 	public static String createLoginSession(String email, String password) throws DBNotFoundException, DBIncorrectPasswordException, DBRollbackException {
 		Session session = sessionFactory.openSession();
 		
 		DBUser user = getUserByEmail(session, email);
 		if (user == null) throw new DBNotFoundException(); // check user exists
-
-		if (!user.getPassword().equals(password)) throw new DBIncorrectPasswordException(); // check password
+		if (!BCrypt.checkpw(password, user.getHashedPassword())) throw new DBIncorrectPasswordException(); // check password
 		
 		DBLoginSession login = createLoginSession(session, user);
-		
 		String token = login.getToken();
 		
 		session.close();
-		
 		return token;
 	}
 	
 	/**
 	 * Deletes a login session (ie logs the user out)
-	 * @param token
+	 * @param token token from user, to be deleted
 	 */
 	public static void deleteLoginSession(Cookie token) {
 		Session session = sessionFactory.openSession();
@@ -176,6 +182,13 @@ public class DB {
 		session.close();
 	}
 	
+	/**
+	 * Creates a new login session for the user
+	 * @param session database session
+	 * @param user user to log in
+	 * @return DBLoginSession containing login token
+	 * @throws DBRollbackException if the database was rolled back (should never happend) 
+	 */
 	private static DBLoginSession createLoginSession(Session session, DBUser user) throws DBRollbackException {
 		DBLoginSession login = new DBLoginSession();
 		login.setLastActivity(System.currentTimeMillis());
@@ -193,10 +206,10 @@ public class DB {
 	}
 
 	/**
-	 * 
-	 * @param session
-	 * @param emailAddress
-	 * @return null if not found
+	 * Get a user from the database by email address
+	 * @param session database session
+	 * @param emailAddress address of user
+	 * @return DBUser, or null if email not in database
 	 */
 	private static DBUser getUserByEmail(Session session, String emailAddress) {
 		
@@ -213,10 +226,10 @@ public class DB {
 	}
 	
 	/** 
-	 * Get a DBUser from the user table by email (use this code to query against non-primary-key columns
-	 * @param email
-	 * @return
-	 * @throws DBNotFoundException 
+	 * Get a user from the user table by email
+	 * @param email user's email address
+	 * @return FlatUser of user
+	 * @throws DBNotFoundException if email address not in database
 	 */
 	public static FlatUser getUserByEmail(String emailAddress) throws DBNotFoundException {
 		Session session = sessionFactory.openSession();
@@ -231,10 +244,10 @@ public class DB {
 	}
 		
 	/**
-	 * 
-	 * @param emailAddress
-	 * @param password
-	 * @param displayName
+	 * Add a new user to the database
+	 * @param emailAddress new user's email address
+	 * @param password new user's password
+	 * @param displayName new user's dislpay name
 	 * @return newly-created login token
 	 * @throws DBRollbackException when email already exists
 	 */
@@ -244,7 +257,7 @@ public class DB {
 		
 		// set all the stuff (remember not to call setId(), as the Hibernate will generate that for us
 		user.setEmail(emailAddress);
-		user.setPassword(password);
+		user.setHashedPassword(BCrypt.hashpw(password, BCrypt.gensalt()));
 		user.setName(displayName);
 		user.setBgColor(0xFFFFFF);
 		user.setTimestamp(System.currentTimeMillis());
@@ -266,6 +279,10 @@ public class DB {
 		// the user is now saved in the database
 	}
 	
+	/**
+	 * Get all posts posted to the website, in order from newest to oldest
+	 * @return list of posts
+	 */
 	public static List<FlatPost> getAllBlogPosts() {
 		Session session = sessionFactory.openSession();
 		
@@ -273,7 +290,7 @@ public class DB {
 		
 		CriteriaQuery<DBPost> query = cb.createQuery(DBPost.class); 
 		Root<DBPost> root = query.from(DBPost.class); 
-		query.select(root); // with no where clause, the query will select the entire table (dangerous in production, fine for an example)
+		query.select(root).orderBy(cb.desc(root.get("date"))); // with no where clause, the query will select the entire table (dangerous in production, fine for an example)
 				
 		List<DBPost> result = session.createQuery(query).list();
 		
@@ -282,21 +299,42 @@ public class DB {
 		return list;
 	}
 	
-	//Retrieve post based on user ID
-	public static FlatPost getPostById(long id) throws DBNotFoundException {
+	public static class BlogPostWithComments {
+		public final FlatPost post;
+		public final List<FlatComment> comments;
+		public BlogPostWithComments(FlatPost post, List<FlatComment> comments) {
+			this.post = post;
+			this.comments = comments;
+		}
+	}
+	
+	/**
+	 * Get a blog post by its id, plus comments on it
+	 * @param id id of blog post
+	 * @return BlogPostWithComments containing FlatPost and List<FlatComments>
+	 * @throws DBNotFoundException if id does not exist in the database
+	 */
+	public static BlogPostWithComments getPostById(long id) throws DBNotFoundException {
 		Session session = sessionFactory.openSession();
 		
 		DBPost result = session.get(DBPost.class, id);
-		
 		if (result == null) throw new DBNotFoundException();
-		
 		FlatPost post = result.flatten();
+		
+		List<FlatComment> comments = session.createQuery("from DBComment comment where comment.post.id=" + id, DBComment.class)
+				.stream().map(comment->comment.flatten()).collect(Collectors.toList());
 		
 		session.close();
 		
-		return post;
+		return new BlogPostWithComments(post, comments) ;
 	}
 	
+	/**
+	 * Get a blog by its id
+	 * @param id id of blog
+	 * @return FlatBlog 
+	 * @throws DBNotFoundException if id does not exist in database
+	 */
 	public static FlatBlog getBlogById(long id) throws DBNotFoundException {
 		Session session = sessionFactory.openSession();
 		
@@ -311,6 +349,14 @@ public class DB {
 		return blog;
 	}
 	
+	/**
+	 * Create a new blog for the user
+	 * @param token token from user
+	 * @param title title of new blog
+	 * @return FlatBlog representation of new blog
+	 * @throws DBNotFoundException if user token does not exist in database (user not logged in)
+	 * @throws DBRollbackException if database was rolled back (should never happen)
+	 */
 	public static FlatBlog addBlog(Cookie token, String title) throws DBNotFoundException, DBRollbackException {
 		Session session = sessionFactory.openSession();
 		
@@ -342,7 +388,16 @@ public class DB {
 		return ret;
 	}
 	
-	//add a post with a Title, Body, Message
+	/**
+	 * Add a new blog post
+	 * @param token token from user
+	 * @param blogid id of blog to add to
+	 * @param title title of new post
+	 * @param body body of new post
+	 * @return FlatPost of new post
+	 * @throws DBNotFoundException if user token or blogid does not exist in database
+	 * @throws DBRollbackException if database was rolled back
+	 */
 	public static FlatPost addPost(Cookie token, long blogid, String title, String body) throws DBNotFoundException, DBRollbackException {
 		Session session = sessionFactory.openSession();
 		
@@ -380,43 +435,52 @@ public class DB {
 		return ret;
 	}
 	
-	//retrieve Posts based on the athor of the post
-	public static List<FlatPost> getPostsByUserId(long id) {
-		Session session = sessionFactory.openSession();
-		
-		List<DBPost> result = session.createQuery("from DBPost post where post.blog.author.id="+id, DBPost.class).list(); // this is HQL, Hibernate Query Language. It's like SQL but simpler, specific to Hibernate, and works with any Hibernate-supported database
-		
-		List<FlatPost> list = result.stream().map(post->post.flatten()).collect(Collectors.toList());
-		session.close(); 
-		return list;
-	}
-	
-	public static List<FlatBlog> getBlogsByUserId(long id) {
-		Session session = sessionFactory.openSession();
-		
-		List<DBBlog> result = session.createQuery("from DBBlog blog where blog.author.id="+id, DBBlog.class).list(); // this is HQL, Hibernate Query Language. It's like SQL but simpler, specific to Hibernate, and works with any Hibernate-supported database
-		
-		List<FlatBlog> list = result.stream().map(post->post.flatten()).collect(Collectors.toList());
-		session.close(); 
-		return list;
+	public static class UserProfileResult {
+		public final FlatUser user;
+		public final List<FlatBlog> blogs;
+		public final List<FlatPost> posts;
+		public UserProfileResult(FlatUser user, List<FlatBlog> blogs, List<FlatPost> posts) {
+			this.user = user;
+			this.blogs = blogs;
+			this.posts = posts;
+		}
 	}
 	
 	/**
-	 * 
-	 * @param email
-	 * @param password
-	 * @param color
-	 * @return FlatUser 
-	 * @throws DBRollbackException
+	 * Get a user profile by user id
+	 * @param id id of user to get profile for
+	 * @return UserProfileResult containing a FlatUser of the user, list of blogs, and list of posts
 	 * @throws DBNotFoundException
+	 */
+	public static UserProfileResult getUserProfile(long id) throws DBNotFoundException {
+		Session session = sessionFactory.openSession();
+		
+		DBUser user = session.get(DBUser.class, id); 
+		if (user == null) throw new DBNotFoundException();
+
+		List<FlatPost> posts = session.createQuery("from DBPost post where post.blog.author.id="+id, DBPost.class)
+				.stream().map(post->post.flatten()).collect(Collectors.toList());
+		
+		List<FlatBlog> blogs = session.createQuery("from DBBlog blog where blog.author.id="+id, DBBlog.class)
+				.stream().map(post->post.flatten()).collect(Collectors.toList()); 
+		
+		session.close();
+		return new UserProfileResult(user.flatten(), blogs, posts);
+	}
+	
+	/**
+	 * Set the background color for a user
+	 * @param token token from user
+	 * @param color new color (ARGB)
+	 * @return FlatUser of user
+	 * @throws DBRollbackException should never happen
+	 * @throws DBNotFoundException token does not exist in database (not logged in)
 	 */
 	public static FlatUser setBgColor(Cookie token, int color) throws DBRollbackException, DBNotFoundException {
 		Session session = sessionFactory.openSession();
 		DBUser user = DB.getUserByToken(session, token);
 		
 		if (user == null) throw new DBNotFoundException();
-				
-		//long userID = user.getId();
 		
 		user.setBgColor(color);
 		
@@ -434,43 +498,15 @@ public class DB {
 		return user.flatten();
 	}
 	
-	public static  List<FlatComment> getAllComments() {
-		Session session = sessionFactory.openSession();
-		
-		CriteriaBuilder cb = session.getCriteriaBuilder(); 
-		
-		CriteriaQuery<DBComment> query = cb.createQuery(DBComment.class); 
-		Root<DBComment> root = query.from(DBComment.class); 
-		query.select(root); 
-		List<DBComment> result = session.createQuery(query).list();
-		
-		List<FlatComment> list = result.stream().map(comment->comment.flatten()).collect(Collectors.toList()); // map DBComment to FlatComment, again, make sure to call flatten() before closing the session
-		session.close(); 
-		return list;
-	}
-	
-	
-	
-	
-	public static FlatComment getCommentById(long id) throws DBNotFoundException {
-		Session session = sessionFactory.openSession();
-		
-		DBComment result = session.get(DBComment.class, id);
-		
-		if (result == null) throw new DBNotFoundException();
-		
-		FlatComment comment = result.flatten();
-		
-		session.close();
-		
-		return comment;
-	}
-	
-	
-	
-	
-	
-	
+	/**
+	 * Add a comment on a blog post
+	 * @param token token from user
+	 * @param body comment body
+	 * @param postID id of post being commented on
+	 * @return FlatComment of comment
+	 * @throws DBNotFoundException if token or postID does not exist in database
+	 * @throws DBRollbackException should never happen
+	 */
 	public static FlatComment addComment(Cookie token, String body, long postID) throws DBNotFoundException, DBRollbackException {
 		Session session = sessionFactory.openSession();
 		
@@ -504,6 +540,11 @@ public class DB {
 		return ret;
 	}
 	
+	/**
+	 * Search blog posts for a search query
+	 * @param search search query
+	 * @return list of FlatPosts which match search query
+	 */
 	public static List<FlatPost> searchPosts(String search) {
 		Session session = sessionFactory.openSession();
 		
@@ -518,23 +559,10 @@ public class DB {
 		return list;
 	}
 	
-	
-	public static List<FlatComment> getCommentsByUserId(long id) {
-		Session session = sessionFactory.openSession();
-		
-		List<DBComment> result = session.createQuery("from DBComment comment where comment.author.id="+id, DBComment.class).list(); 
-		
-		List<FlatComment> list = result.stream().map(comment->comment.flatten()).collect(Collectors.toList());
-		session.close(); 
-		return list;
-	}
-	
-	
 	/**
 	 * Submit a user report
-	 * @param token
-	 * @param phone
-	 * @param suggestion
+	 * @param token token from user
+	 * @param suggestion body of user report
 	 * @throws DBNotFoundException if user not found
 	 * @throws DBRollbackException should not happen
 	 */
@@ -567,17 +595,6 @@ public class DB {
 	}
 	
 	/**
-	 * Returns all comments on post with id
-	 * @param postID id of the post for which to get comments
-	 * @return
-	 */
-	public static List<FlatComment> getCommentsOnPost(long postID) {
-		Session session = sessionFactory.openSession();
-		List<DBComment> list = session.createQuery("from DBComment comment where comment.post.id=" + postID, DBComment.class).list();
-		return list.stream().map(FlatComment::new).collect(Collectors.toList());
-	}
-	
-	/**
 	 * (attempt to) change a user's password
 	 * @param token 
 	 * @param password current password, to be checked
@@ -594,12 +611,12 @@ public class DB {
 		DBUser user = DB.getUserByToken(session, token);
 		if (user == null) throw new DBNotFoundException();
 		
-		if (!password.equals(user.getPassword())) throw new DBIncorrectPasswordException(user.flatten());
+		if (!BCrypt.checkpw(password, user.getHashedPassword())) throw new DBIncorrectPasswordException(user.flatten());
 		if (!password1.equals(password2)) throw new DBPasswordMismatchException(user.flatten());
 		
 		session.beginTransaction();
 		try {
-			user.setPassword(password1);
+			user.setHashedPassword(BCrypt.hashpw(password1, BCrypt.gensalt()));
 			session.merge(user);
 			session.getTransaction().commit();
 		} catch (Exception e) {
@@ -610,18 +627,6 @@ public class DB {
 		FlatUser fuser = user.flatten();
 		session.close(); 
 		return fuser;
-	}
-	
-	public static void main(String[] args) {
-		DB.startDatabaseConnection();
-		Session session = DB.sessionFactory.openSession();
-		boolean sent = DB.sendEmail("lpreams@gmail.com", "Blog Project Test", "This is a test of our project's ability to send email", session);
-		session.close();
-		
-		if (sent) System.out.println("Sent successfully");
-		else System.out.println("Failed to send");
-		
-		System.exit(0);
 	}
 	
     /**
@@ -666,21 +671,21 @@ public class DB {
 		return true;
 	}
 	
-	/*private static void emailSetup() {
+	/*private static void emailSetup(String SMTP_EMAIL, String SMTP_PASSWORD, String SMTP_SERVER) {
 		DB.startDatabaseConnection();
 		Session session = DB.sessionFactory.openSession();
 		
 		DBSiteSetting email = new DBSiteSetting();
 		email.setKey("SMTP_EMAIL");
-		email.setValue("your.email.address@example.com");
+		email.setValue(SMTP_EMAIL);
 		
 		DBSiteSetting password = new DBSiteSetting();
 		password.setKey("SMTP_PASSWORD");
-		password.setValue("ThIsIsYoUrEmAiLpAsSwOrD");
+		password.setValue(SMTP_PASSWORD);
 		
 		DBSiteSetting server = new DBSiteSetting();
 		server.setKey("SMTP_SERVER");
-		server.setValue("smtp.example.com");
+		server.setValue(SMTP_SERVER);
 		
 		try {
 			session.beginTransaction();
@@ -697,6 +702,71 @@ public class DB {
 		System.exit(0);
 	}*/
 	
+	/**
+	 * Send user an email allowing them to reset their password
+	 * @param email User-inputted email address linked to user account
+	 * @throws DBNotFoundException if email not found in database
+	 * @throws DBEmailFailedToSendException if backend failed to send email
+	 * @throws DBRollbackException database rollback (should never happen)
+	 */
+	public static void forgotPassword(String email, String newPassword) throws DBNotFoundException, DBEmailFailedToSendException, DBRollbackException {
+		Session session = DB.sessionFactory.openSession();
+		
+		DBUser user = DB.getUserByEmail(session, email);
+		if (user == null) throw new DBNotFoundException();
+		
+		DBPasswordReset reset = new DBPasswordReset();
+		reset.setUser(user);
+		reset.setDate(System.currentTimeMillis());
+		reset.setToken(generateLoginToken(session));
+		reset.setNewHashedPassword(BCrypt.hashpw(newPassword, BCrypt.gensalt()));
+		
+		String body = "To reset your password, <a href=http://localhost:8080/resetpassword/" + 
+				reset.getToken() + 
+				">click here</a> or copy/paste the following link to your browser: http://localhost:8080/resetpassword/" + 
+				reset.getToken() +
+				"<br/>This link will expire in 24 hours.";
+		if (!DB.sendEmail(user.getEmail(), "Blog password reset", body, session)) throw new DB.DBEmailFailedToSendException();
+		
+		session.beginTransaction();
+		try {
+			session.save(reset);
+			session.getTransaction().commit();
+		} catch (Exception e) {
+			session.getTransaction().rollback();
+			throw new DBRollbackException();
+		}
+		
+		session.close();
+	}
+	
+	public static void resetPassword(String token) throws DBNotFoundException, DBRollbackException {
+		Session session = DB.sessionFactory.openSession();
+		
+		List<DBPasswordReset> list = session.createQuery("from DBPasswordReset where token='" + token + "'", DBPasswordReset.class).list();
+		if (list.size() < 1) throw new DBNotFoundException();
+		DBPasswordReset pr = list.get(0);
+		DBUser user = pr.getUser();
+		
+		try {
+			session.beginTransaction();
+			user.setHashedPassword(pr.getNewHashedPassword());
+			pr.setUser(null);
+			session.merge(user);
+			session.delete(pr);
+			session.getTransaction().commit();
+		} catch (Exception e) {
+			session.getTransaction().rollback();
+			throw new DBRollbackException();
+		}
+		session.close();
+	}
+	
+	/**
+	 * Generate a unique login token
+	 * @param session database session
+	 * @return new login token
+	 */
 	private static String generateLoginToken(Session session) {
 		List<Character> list = new ArrayList<>();
 		Random r = new Random();
@@ -706,7 +776,9 @@ public class DB {
 		while (true) {
 			StringBuilder sb = new StringBuilder();
 			for (int i=0; i<200; ++i) sb.append(list.get(r.nextInt(list.size())));
-			if (session.createQuery("from DBLoginSession where token='" + sb.toString() + "'").list().size() == 0) return sb.toString();
+			if (session.createQuery("from DBLoginSession where token='" + sb.toString() + "'").list().size() != 0) continue;
+			else if (session.createQuery("from DBPasswordReset where token='" + sb.toString() + "'").list().size() != 0) continue;
+			else return sb.toString();
 		}
 	}
 	
@@ -749,6 +821,13 @@ public class DB {
 		public DBIncorrectPasswordException(FlatUser user) {
 			super("password incorrect, no changes made");
 			this.user = user;
+		}
+	}
+	
+	public static class DBEmailFailedToSendException extends Exception {
+		private static final long serialVersionUID = -4642299875091351165L;
+		public DBEmailFailedToSendException() {
+			super("Email failed to send");
 		}
 	}
 }
